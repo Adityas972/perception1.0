@@ -63,6 +63,32 @@ def extract_embedding_with_attention(frames: list[np.ndarray]):
     return pooled, attentions
 
 
+def forward_with_grad(frames: list[np.ndarray]):
+    """Runs VideoMAE with gradients enabled, for gradient-weighted attention
+    rollout (interpret/grad_rollout.py). The backbone's *parameters* stay
+    frozen (requires_grad=False, set once in _load_model) — we only need
+    gradients to flow through the *activations* so we can backprop an
+    anomaly score into the attention maps, not to update any weights.
+
+    Returns (pooled_embedding, attentions), both still attached to the
+    autograd graph — the caller is responsible for calling .backward() and
+    reading .grad off the attention tensors before they go out of scope.
+    """
+    processor, model, device = _load_model()
+    inputs = processor(list(frames), return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # every model parameter is frozen (requires_grad=False), so without this
+    # the whole forward pass would have no tensor requiring grad at all and
+    # `.backward()` would fail with "does not require grad and does not have
+    # a grad_fn" — the input pixel values are what seeds the graph.
+    inputs["pixel_values"].requires_grad_(True)
+    outputs = model(**inputs, output_attentions=True)
+    for attn in outputs.attentions:
+        attn.retain_grad()  # non-leaf tensors don't keep .grad by default
+    pooled = outputs.last_hidden_state.mean(dim=1)  # (1, 768)
+    return pooled, outputs.attentions
+
+
 def patch_grid_shape(num_frames: int = 16, tubelet_size: int = 2, image_size: int = 224, patch_size: int = 16):
     """VideoMAE's patch embedding grid: (temporal, height, width) in tokens."""
     t = num_frames // tubelet_size

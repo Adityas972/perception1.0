@@ -11,6 +11,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import torch
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 
@@ -24,6 +25,26 @@ class AnomalyScorer:
         """embeddings: (N, 768). Returns (N,) anomaly scores, higher = more anomalous."""
         x = self.scaler.transform(embeddings)
         return -self.ocsvm.decision_function(x)
+
+    def torch_score(self, embedding: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Differentiable re-implementation of `score`, for backprop through
+        the anomaly score into the frozen VideoMAE backbone (see
+        interpret/grad_rollout.py). embedding: (1, 768), requires_grad.
+        Must match `.score()` bit-for-bit; verified in tests/test_torch_score.py.
+        """
+        mean = torch.as_tensor(self.scaler.mean_, dtype=embedding.dtype, device=device)
+        scale = torch.as_tensor(self.scaler.scale_, dtype=embedding.dtype, device=device)
+        x = (embedding - mean) / scale
+
+        sv = torch.as_tensor(self.ocsvm.support_vectors_, dtype=embedding.dtype, device=device)
+        dual_coef = torch.as_tensor(self.ocsvm.dual_coef_, dtype=embedding.dtype, device=device)  # (1, n_sv)
+        intercept = torch.as_tensor(self.ocsvm.intercept_, dtype=embedding.dtype, device=device)  # (1,)
+        gamma = float(self.ocsvm._gamma)
+
+        sq_dist = (x.unsqueeze(1) - sv.unsqueeze(0)).pow(2).sum(dim=-1)  # (1, n_sv)
+        kernel = torch.exp(-gamma * sq_dist)
+        decision = (kernel * dual_coef).sum(dim=-1) + intercept  # (1,)
+        return -decision.squeeze(0)  # higher = more anomalous, matches .score()
 
     def save(self, path: Path):
         joblib.dump({"scaler": self.scaler, "ocsvm": self.ocsvm}, path)

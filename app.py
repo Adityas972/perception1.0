@@ -1,5 +1,8 @@
 """Gradio demo: upload a video clip, get a per-frame anomaly score curve and
-an attention-rollout saliency overlay on the most anomalous window.
+a gradient-weighted attention-rollout saliency overlay on the most anomalous
+window — i.e. which patches specifically pushed *this* window's score up,
+not just what the transformer attends to in general (see
+interpret/grad_rollout.py).
 
 Scorers are pre-trained by train.py on UCSD Ped1 (uploaded clips should be
 CCTV-style pedestrian-walkway footage for the scores to be meaningful — this
@@ -11,10 +14,10 @@ import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
 
-from interpret.rollout import spatiotemporal_map
+from interpret.grad_rollout import explain
 from interpret.visualize import overlay_saliency
 from model.classifier import AnomalyScorer
-from model.feature_extractor import extract_embedding_with_attention, patch_grid_shape
+from model.feature_extractor import extract_embedding, patch_grid_shape
 from utils.video_io import load_video_file, sliding_windows
 
 CHECKPOINTS_DIR = Path("checkpoints")
@@ -38,14 +41,10 @@ def analyze(video_path: str, scene: str):
     scorer = get_scorer(scene)
     windows = sliding_windows(frames, num_frames=NUM_FRAMES, stride=STRIDE)
 
-    window_scores = []
-    window_attns = []
-    for w in windows:
-        emb, attn = extract_embedding_with_attention(w)
-        window_scores.append(scorer.score(emb[None, :])[0])
-        window_attns.append(attn)
+    # cheap frozen forward pass (no backward) to score every window and find
+    # the peak — only the peak window gets the more expensive gradient pass.
+    window_scores = [scorer.score(extract_embedding(w)[None, :])[0] for w in windows]
 
-    # score curve
     fig, ax = plt.subplots(figsize=(8, 2.5))
     ax.plot(window_scores, marker="o", color="#d62728")
     ax.set_xlabel("window index")
@@ -53,14 +52,12 @@ def analyze(video_path: str, scene: str):
     ax.set_title(f"Anomaly score per {NUM_FRAMES}-frame window (stride {STRIDE})")
     fig.tight_layout()
 
-    # saliency overlay on the most anomalous window
     peak_idx = int(np.argmax(window_scores))
-    peak_window = windows[peak_idx]
     grid_shape = patch_grid_shape(num_frames=NUM_FRAMES)
-    saliency = spatiotemporal_map(window_attns[peak_idx], grid_shape)[0].numpy()
-    overlaid = overlay_saliency(peak_window, saliency)
+    peak_score, saliency = explain(windows[peak_idx], scorer, grid_shape)
+    overlaid = overlay_saliency(windows[peak_idx], saliency)
 
-    return fig, overlaid, f"Peak anomaly score: {window_scores[peak_idx]:.3f} (window {peak_idx})"
+    return fig, overlaid, f"Peak anomaly score: {peak_score:.3f} (window {peak_idx})"
 
 
 with gr.Blocks(title="Explainable Video Anomaly Detection") as demo:
@@ -68,7 +65,8 @@ with gr.Blocks(title="Explainable Video Anomaly Detection") as demo:
         "# Explainable Video Anomaly Detection\n"
         "Frozen VideoMAE embeddings + a one-class SVM trained only on *normal* "
         "footage (UCSD Ped1/Ped2). Upload a clip to get a per-window anomaly "
-        "score and a temporal attention-rollout saliency overlay on the most "
+        "score and a gradient-weighted attention-rollout saliency overlay "
+        "showing which patches specifically drove the score on the most "
         "anomalous window."
     )
     with gr.Row():

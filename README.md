@@ -9,11 +9,15 @@ built to run entirely on a laptop with no dedicated GPU and no paid APIs:
 - **Anomaly scoring**: a one-class SVM trained only on *normal* footage
   (UCSD Ped's Train split contains no anomalies), scored via distance from
   the learned normal-embedding boundary.
-- **Explainability**: attention rollout (Abnar & Zuidema, 2020) adapted for
-  VideoMAE's spatiotemporal patch tokens (no [CLS] token, so importance is
-  read off as each token's average influence on the mean-pooled output
-  rather than a single CLS row) — shown as a heatmap overlay on the frames
-  that triggered a high anomaly score.
+- **Explainability**: gradient-weighted attention rollout (`interpret/grad_rollout.py`,
+  following Chefer et al. CVPR 2021 / the "grad rollout" recipe) — the
+  anomaly score is backpropagated through the frozen VideoMAE backbone into
+  its attention weights, so the resulting heatmap shows what specifically
+  pushed *this* clip's score up, not just generic attention (see
+  `interpret/rollout.py` for the plain, unconditional version this replaced).
+  Requires a differentiable reimplementation of the one-class SVM's decision
+  function (`model/classifier.py:torch_score`), checked to match sklearn's
+  `decision_function` to float precision in `tests/test_torch_score.py`.
 - **Demo**: a Gradio app — upload a clip, get a per-window anomaly score
   curve and a saliency overlay on the most anomalous window.
 
@@ -62,6 +66,19 @@ corrupted PackBits-encoded TIFF from the original 2010 dataset release);
 `utils.video_io.load_frame_dir` silently drops unreadable frames, which
 shifts that one clip's frame indices by one relative to its ground truth.
 Negligible for the aggregate AUC (1 bad frame out of ~9,300 test frames).
+
+**Limitation found while validating the explainability feature**: on
+UCSDped1 Test003 (ground truth anomaly = frames 91–200), the highest-scoring
+window actually falls just *before* the anomaly's onset, and scores dip
+during the core anomalous segment before partially recovering near the end.
+The gradient-weighted rollout itself is verified correct — it produces
+real, non-degenerate spatiotemporal variation — but on this clip it ends up
+highlighting a static background region (a tree/bush) rather than the
+specific anomalous object. This is a property of the underlying frozen-embedding
++ one-class-SVM classifier's imperfect temporal localization (consistent with
+the 0.696–0.743 AUCs), not a bug in the rollout math. Worth keeping in mind:
+the saliency map explains what the *classifier* keyed on, which isn't always
+what a human would call "the anomaly."
 
 ## Why this design
 
